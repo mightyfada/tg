@@ -1,6 +1,7 @@
 require("dotenv").config();
 const TelegramBot = require("node-telegram-bot-api");
 const fs = require("fs");
+const https = require("https");
 
 // ─── Config ────────────────────────────────────────────────────────────────
 const TOKEN = process.env.TELEGRAM_TOKEN;
@@ -639,37 +640,37 @@ bot.on("message", async (msg) => {
   if (count === 1) {
     // Q1: Describe the issue
     await bot.sendMessage(chatId,
-      `Hello *${msg.from.first_name}*! 👋\n\nThank you for reaching out. To help you as quickly as possible, I'll need to ask you a few questions.\n\n*Question 1:* Please describe your crypto issue in detail. What exactly is happening? 🔍`,
+      `Hello *${msg.from.first_name}*! 👋\n\nThank you for reaching out. To help you as quickly as possible, I'll need to ask you a few questions.\n\nPlease describe your crypto issue in detail. What exactly is happening? 🔍`,
       { parse_mode: "Markdown" }
     );
   } else if (count === 2) {
     // Q2: Wallet type
     await bot.sendMessage(chatId,
-      `Thank you for that information! ✅\n\n*Question 2:* What type of wallet are you using?\n\nExamples: MetaMask, Trust Wallet, Coinbase Wallet, Phantom, Ledger, Binance, etc. 💼`,
+      `Thank you for that information! ✅\n\nWhat type of wallet are you using?\n\nExamples: MetaMask, Trust Wallet, Coinbase Wallet, Phantom, Ledger, Binance, etc. 💼`,
       { parse_mode: "Markdown" }
     );
   } else if (count === 3) {
     // Q3: Wallet address
     await bot.sendMessage(chatId,
-      `Got it! 📝\n\n*Question 3:* Please provide your *wallet address*.\n\nThis will allow us to investigate your issue on the blockchain. 🔗`,
+      `Got it! 📝\n\nPlease provide your *wallet address*.\n\nThis will allow us to investigate your issue on the blockchain. 🔗`,
       { parse_mode: "Markdown" }
     );
   } else if (count === 4) {
     // Q4: How long has the issue been occurring
     await bot.sendMessage(chatId,
-      `Thank you! 🙏\n\n*Question 4:* How long have you been experiencing this issue?\n\nExamples:\n• Just started today\n• A few hours ago\n• Since yesterday\n• Over a week\n• More than a month 🕐`,
+      `Thank you! 🙏\n\nHow long have you been experiencing this issue?\n\nExamples:\n• Just started today\n• A few hours ago\n• Since yesterday\n• Over a week\n• More than a month 🕐`,
       { parse_mode: "Markdown" }
     );
   } else if (count === 5) {
     // Q5: Transaction ID if applicable
     await bot.sendMessage(chatId,
-      `Noted! 📋\n\n*Question 5:* Do you have a *transaction ID / hash* related to this issue?\n\nIf yes, please paste it below. If not, type *"No transaction ID"*. 🔎`,
+      `Noted! 📋\n\nDo you have a *transaction ID / hash* related to this issue?\n\nIf yes, please paste it below. If not, type *"No transaction ID"*. 🔎`,
       { parse_mode: "Markdown" }
     );
   } else if (count === 6) {
     // Q6: Amount involved
     await bot.sendMessage(chatId,
-      `Thank you! 💰\n\n*Question 6:* What is the *amount* involved in this issue?\n\nPlease include the coin/token name and amount (e.g. *0.5 ETH*, *200 USDT*, *0.002 BTC*). 📊`,
+      `Thank you! 💰\n\nWhat is the *amount* involved in this issue?\n\nPlease include the coin/token name and amount (e.g. *0.5 ETH*, *200 USDT*, *0.002 BTC*). 📊`,
       { parse_mode: "Markdown" }
     );
   } else {
