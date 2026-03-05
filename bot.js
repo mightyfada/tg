@@ -10,6 +10,7 @@ const ADMIN_IDS = process.env.ADMIN_IDS
 const ADMIN_GROUP_ID = process.env.ADMIN_GROUP_ID
   ? parseInt(process.env.ADMIN_GROUP_ID)
   : null;
+const GEMINI_KEY = process.env.GEMINI_API_KEY || null;
 
 // ─── Storage ───────────────────────────────────────────────────────────────
 const DB_PATH = "./tickets.json";
@@ -27,6 +28,57 @@ const bot = new TelegramBot(TOKEN, { polling: true });
 // ─── Helpers ───────────────────────────────────────────────────────────────
 function generateTicketId() {
   return Math.floor(1000 + Math.random() * 9000).toString();
+}
+
+// ─── AI Response Validator (Google Gemini) ─────────────────────────────────
+async function isResponseRelevant(question, userReply) {
+  if (!GEMINI_KEY) return null; // fall back to manual check if no key
+
+  const prompt =
+    "You are a support bot validator. A user was asked this question:\n" +
+    "QUESTION: " + question + "\n\n" +
+    "The user replied:\n" +
+    "REPLY: " + userReply + "\n\n" +
+    "Does the reply make sense as an answer to the question? " +
+    "Reply with only one word: YES or NO.";
+
+  try {
+    const postData = JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { maxOutputTokens: 5, temperature: 0 }
+    });
+
+    const result = await new Promise((resolve, reject) => {
+      const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=" + GEMINI_KEY;
+      const urlObj = new URL(url);
+      const req = https.request({
+        hostname: urlObj.hostname,
+        path: urlObj.pathname + urlObj.search,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(postData)
+        }
+      }, (res) => {
+        let body = "";
+        res.on("data", (chunk) => body += chunk);
+        res.on("end", () => {
+          try { resolve(JSON.parse(body)); }
+          catch (e) { reject(e); }
+        });
+      });
+      req.on("error", reject);
+      req.setTimeout(8000, () => { req.destroy(); reject(new Error("Timeout")); });
+      req.write(postData);
+      req.end();
+    });
+
+    const text = result?.candidates?.[0]?.content?.parts?.[0]?.text?.trim().toUpperCase() || "NO";
+    return text.startsWith("YES");
+  } catch (e) {
+    console.log("Gemini check failed:", e.message);
+    return null; // fall back to manual check
+  }
 }
 
 function isAdmin(userId) {
@@ -187,6 +239,9 @@ bot.onText(/\/reply (\d+) (.+)/s, async (msg, match) => {
 
 // ─── Button Callbacks ──────────────────────────────────────────────────────
 bot.on("callback_query", async (query) => {
+  // Ignore expired callbacks silently
+  try { await bot.answerCallbackQuery(query.id).catch(() => {}); } catch (e) {}
+  try {
   const userId = query.from.id;
   const chatId = query.message.chat.id;
   const data = query.data;
@@ -335,6 +390,13 @@ bot.on("callback_query", async (query) => {
   }
 
   // ── Close Button ─────────────────────────────────────────────────────────
+  } catch (e) {
+    if (!e.message.includes('query is too old') && !e.message.includes('query ID is invalid')) {
+      console.error('Callback error:', e.message);
+    }
+    return;
+  }
+
   if (data.startsWith("close_")) {
     if (!isAdmin(userId)) {
       return bot.answerCallbackQuery(query.id, {
@@ -446,11 +508,133 @@ bot.on("message", async (msg) => {
   // Stop auto-responses once claimed — admin takes over
   if (ticket.claimedBy) return;
 
-  // Show typing indicator then auto-respond
+  // ── Meaningful message detection ─────────────────────────────────────────
+  function isMeaningful(text) {
+    const t = text.trim().toLowerCase();
+    if (t.length <= 2) return false;
+
+    const junk = [
+      "ok","okay","k","kk","yes","no","nope","yep","sure","hi","hello","hey",
+      "hmm","hm","uh","um","lol","lmao","haha","hehe","what","why","how",
+      "idk","idc","nvm","never mind","nothing","test","testing","hello?",
+      "??","???","...","w","ww","www","good","fine","cool","nice","great"
+    ];
+    if (junk.includes(t)) return false;
+
+    const wordCount = t.split(/\s+/).filter(Boolean).length;
+    if (wordCount < 3 && t.length < 15) return false;
+
+    // Repeated characters — "aaaaaaa"
+    if (/([a-z])\1{4,}/.test(t)) return false;
+
+    // Keyboard mashing — "asdfgh", "qwerty"
+    const mashPatterns = [/asdf/i, /qwer/i, /zxcv/i, /hjkl/i, /uiop/i];
+    if (mashPatterns.some((p) => p.test(t))) return false;
+
+    // All same word repeated
+    const words = t.split(/\s+/).filter(Boolean);
+    const uniqueWords = new Set(words);
+    if (words.length >= 3 && uniqueWords.size === 1) return false;
+
+    // No vowels = gibberish
+    const letters = t.replace(/[^a-z]/g, "");
+    if (letters.length > 5) {
+      const vowels = (t.match(/[aeiou]/g) || []).length;
+      if (vowels / letters.length < 0.1) return false;
+    }
+
+    // Real word check — at least 40% must be recognizable words
+    const commonWords = new Set([
+      "i","my","me","we","us","you","he","she","they","it","is","am","are",
+      "was","were","have","has","had","do","did","does","will","would","could",
+      "should","can","the","a","an","and","or","but","if","in","on","at","to",
+      "for","of","with","by","from","not","so","this","that","what","when",
+      "where","who","how","help","need","want","problem","issue","error","money",
+      "send","receive","wallet","account","access","funds","transaction","transfer",
+      "crypto","bitcoin","eth","token","address","balance","withdraw","deposit",
+      "please","thank","thanks","cant","cannot","dont","lost","stuck","wrong",
+      "tried","still","just","get","got","see","know","think","make","use","used",
+      "today","yesterday","week","month","hours","days","ago","since","long","been",
+      "metamask","trust","coinbase","phantom","ledger","binance","amount","usdt",
+      "btc","bnb","matic","sol","hash","id","number","started","happening","issue"
+    ]);
+    const words2 = t.split(/\s+/).filter(Boolean);
+    const realCount = words2.filter((w) => commonWords.has(w)).length;
+    if (words2.length <= 6 && realCount / words2.length < 0.35) return false;
+
+    return true;
+  }
+
+  // Count only meaningful replies so far for this ticket
+  const meaningfulCount = ticket.replies.filter(
+    (r) => r.author === (msg.from.username || msg.from.first_name) && isMeaningful(r.message)
+  ).length;
+
   await bot.sendChatAction(chatId, "typing");
   await new Promise((r) => setTimeout(r, 2500));
 
-  const count = ticket.messageCount;
+  // ── AI-powered relevance check ──────────────────────────────────────────
+  // Map stage to the question the bot last asked
+  const questionMap = {
+    1: "Please describe your crypto issue in detail. What exactly is happening?",
+    2: "What type of wallet are you using? (e.g. MetaMask, Trust Wallet, Coinbase, Ledger)",
+    3: "Please provide your wallet address.",
+    4: "How long have you been experiencing this issue?",
+    5: "Do you have a transaction ID or hash related to this issue?",
+    6: "What is the amount involved in this issue? Include coin name and amount.",
+  };
+
+  const currentStage = meaningfulCount + 1;
+  const currentQuestion = questionMap[currentStage] || questionMap[1];
+
+  // First run manual check, then AI check if manual passes
+  let relevant = isMeaningful(msg.text);
+
+  // If manual check passes, ask AI to double-check context relevance
+  if (relevant && GEMINI_KEY) {
+    const aiResult = await isResponseRelevant(currentQuestion, msg.text);
+    if (aiResult !== null) relevant = aiResult; // use AI result if available
+  }
+
+  // If not meaningful — repeat the current question
+  if (!relevant) {
+    const stage = meaningfulCount + 1; // which question we're on
+    if (stage === 1) {
+      await bot.sendMessage(chatId,
+        `Please describe your crypto issue in more detail, *${msg.from.first_name}*. What exactly is happening? 🔍`,
+        { parse_mode: "Markdown" }
+      );
+    } else if (stage === 2) {
+      await bot.sendMessage(chatId,
+        `Please tell me what type of wallet you are using (e.g. MetaMask, Trust Wallet, Coinbase, Ledger, etc.) 💼`,
+        { parse_mode: "Markdown" }
+      );
+    } else if (stage === 3) {
+      await bot.sendMessage(chatId,
+        `Please provide your *wallet address* so I can investigate your issue on the blockchain. 🔗`,
+        { parse_mode: "Markdown" }
+      );
+    } else if (stage === 4) {
+      await bot.sendMessage(chatId,
+        `How long have you been experiencing this issue? (e.g. just today, a few hours, since yesterday, over a week) 🕐`,
+        { parse_mode: "Markdown" }
+      );
+    } else if (stage === 5) {
+      await bot.sendMessage(chatId,
+        `Do you have a *transaction ID / hash* for this issue? If yes paste it, if not type *"No transaction ID"*. 🔎`,
+        { parse_mode: "Markdown" }
+      );
+    } else if (stage === 6) {
+      await bot.sendMessage(chatId,
+        `What is the *amount* involved? Please include the coin name (e.g. *0.5 ETH*, *200 USDT*, *0.002 BTC*). 💰`,
+        { parse_mode: "Markdown" }
+      );
+    }
+    return;
+  }
+
+  // Meaningful — use meaningfulCount to track stage (not raw messageCount)
+  const count = meaningfulCount;
 
   if (count === 1) {
     // Q1: Describe the issue
@@ -515,6 +699,19 @@ bot.on("message", async (msg) => {
       } catch (e) {}
     }
   }
+});
+
+// ─── Global Error Handlers (prevent crashes) ──────────────────────────────
+bot.on("polling_error", (err) => {
+  if (!err.message.includes("ETELEGRAM")) {
+    console.error("Polling error:", err.message);
+  }
+});
+
+process.on("unhandledRejection", (err) => {
+  const msg = err?.message ?? String(err);
+  if (msg.includes("query is too old") || msg.includes("query ID is invalid")) return;
+  console.error("Unhandled rejection:", msg);
 });
 
 console.log("✅ Telegram Support Ticket Bot is running...");
