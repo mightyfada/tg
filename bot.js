@@ -36,11 +36,14 @@ async function isResponseRelevant(question, userReply) {
   if (!GEMINI_KEY) return null; // fall back to manual check if no key
 
   const prompt =
-    "You are a support bot validator. A user was asked this question:\n" +
+    "You are a support bot validator for a crypto support system. A user was asked this question:\n" +
     "QUESTION: " + question + "\n\n" +
     "The user replied:\n" +
     "REPLY: " + userReply + "\n\n" +
     "Does the reply make sense as an answer to the question? " +
+    "Be lenient — short answers like wallet names (MetaMask, OKX, Trust), time references (today, yesterday, a week), " +
+    "amounts (0.5 ETH, 200 USDT), or brief but relevant answers are valid. " +
+    "Only say NO if the reply is completely unrelated, gibberish, or nonsensical. " +
     "Reply with only one word: YES or NO.";
 
   try {
@@ -514,6 +517,19 @@ bot.on("message", async (msg) => {
     const t = text.trim().toLowerCase();
     if (t.length <= 2) return false;
 
+    // ── Always accept known wallet names ──────────────────────────────────
+    const walletNames = [
+      "metamask","trust","trustwallet","trust wallet","coinbase","phantom",
+      "ledger","trezor","binance","okx","okx wallet","bybit","kraken",
+      "exodus","atomic","myetherwallet","mew","rainbow","argent","zerion",
+      "1inch","uniswap","pancakeswap","keplr","terra","solflare","slope",
+      "backpack","glow","safe","gnosis","imtoken","tokenpocket","bitkeep",
+      "safepal","mathwallet","ellipal","secux","bitbox","keepkey","ngrave",
+      "rabby","frame","status","unstoppable","xdefi","sender","near","petra",
+      "martian","pontem","fewcha","welldone","coin98","onto","alphawallet"
+    ];
+    if (walletNames.some((w) => t === w || t.includes(w))) return true;
+
     const junk = [
       "ok","okay","k","kk","yes","no","nope","yep","sure","hi","hello","hey",
       "hmm","hm","uh","um","lol","lmao","haha","hehe","what","why","how",
@@ -574,131 +590,219 @@ bot.on("message", async (msg) => {
   await bot.sendChatAction(chatId, "typing");
   await new Promise((r) => setTimeout(r, 2500));
 
-  // ── AI-powered relevance check ──────────────────────────────────────────
-  // Map stage to the question the bot last asked
+  const tLower = msg.text.trim().toLowerCase();
+  const isNo = ["no","nope","nah","none","i don't","i dont","don't have","dont have","no tx","no transaction","n/a","na"].some(w => tLower.includes(w));
+  const isYes = ["yes","yep","yeah","i have","i do","sure"].some(w => tLower === w || tLower.startsWith(w + " "));
+
+  // ── Smart stage tracking stored on ticket ──────────────────────────────
+  if (!ticket.stage) ticket.stage = 1;
+  const stage = ticket.stage;
+
+  // ── Question map ────────────────────────────────────────────────────────
   const questionMap = {
     1: "Please describe your crypto issue in detail. What exactly is happening?",
     2: "What type of wallet are you using? (e.g. MetaMask, Trust Wallet, Coinbase, Ledger)",
     3: "Please provide your wallet address.",
     4: "How long have you been experiencing this issue?",
     5: "Do you have a transaction ID or hash related to this issue?",
-    6: "What is the amount involved in this issue? Include coin name and amount.",
+    "5b": "Please paste your transaction ID / hash below.",
+    6: "What is the amount involved? Include coin name and amount (e.g. 0.5 ETH, 200 USDT).",
   };
 
-  const currentStage = meaningfulCount + 1;
-  const currentQuestion = questionMap[currentStage] || questionMap[1];
+  // Stages that accept yes/no
+  const yesNoStages = [5];
+  const isYesNo = isYes || isNo;
 
-  // First run manual check, then AI check if manual passes
+  // Run manual meaningful check
   let relevant = isMeaningful(msg.text);
 
-  // If manual check passes, ask AI to double-check context relevance
+  // Allow yes/no for stages that accept it
+  if (!relevant && isYesNo && yesNoStages.includes(stage)) relevant = true;
+
+  // AI double-check
   if (relevant && GEMINI_KEY) {
+    const currentQuestion = questionMap[stage] || questionMap[1];
     const aiResult = await isResponseRelevant(currentQuestion, msg.text);
-    if (aiResult !== null) relevant = aiResult; // use AI result if available
+    if (aiResult !== null) relevant = aiResult;
   }
 
-  // If not meaningful — repeat the current question
+  // ── Not relevant — repeat current question with nudge ──────────────────
   if (!relevant) {
-    const stage = meaningfulCount + 1; // which question we're on
     if (stage === 1) {
-      await bot.sendMessage(chatId,
-        `Please describe your crypto issue in more detail, *${msg.from.first_name}*. What exactly is happening? 🔍`,
-        { parse_mode: "Markdown" }
-      );
+      // Check if they said a greeting — respond warmly instead of scolding
+      const greetings = ["hi","hey","hello","hii","heyyy","heyy","good morning","good afternoon","good evening","morning","afternoon","evening","howdy","sup","what's up","whats up","greetings","yo"];
+      const isGreeting = greetings.some(g => tLower === g || tLower.startsWith(g + " ") || tLower.endsWith(" " + g));
+
+      if (isGreeting) {
+        await bot.sendMessage(chatId,
+          `Hello *${msg.from.first_name}*! 👋 How are you?\n\nI'm here to help you with any crypto issues you may be experiencing.\n\nCould you please describe what's going on so I can assist you? 🔍`,
+          { parse_mode: "Markdown" });
+      } else {
+        await bot.sendMessage(chatId,
+          `I need a bit more detail, *${msg.from.first_name}*. What crypto issue are you experiencing exactly? 🔍`,
+          { parse_mode: "Markdown" });
+      }
     } else if (stage === 2) {
       await bot.sendMessage(chatId,
-        `Please tell me what type of wallet you are using (e.g. MetaMask, Trust Wallet, Coinbase, Ledger, etc.) 💼`,
-        { parse_mode: "Markdown" }
-      );
+        `What wallet are you using? (e.g. MetaMask, Trust Wallet, OKX, Coinbase, Ledger) 💼`,
+        { parse_mode: "Markdown" });
     } else if (stage === 3) {
       await bot.sendMessage(chatId,
-        `Please provide your *wallet address* so I can investigate your issue on the blockchain. 🔗`,
-        { parse_mode: "Markdown" }
-      );
+        `Please send your *wallet address* — it starts with 0x for ETH/BSC wallets. 🔗`,
+        { parse_mode: "Markdown" });
     } else if (stage === 4) {
       await bot.sendMessage(chatId,
-        `How long have you been experiencing this issue? (e.g. just today, a few hours, since yesterday, over a week) 🕐`,
-        { parse_mode: "Markdown" }
-      );
+        `How long has this been happening? (e.g. today, yesterday, a few hours, over a week) 🕐`,
+        { parse_mode: "Markdown" });
     } else if (stage === 5) {
       await bot.sendMessage(chatId,
-        `Do you have a *transaction ID / hash* for this issue? If yes paste it, if not type *"No transaction ID"*. 🔎`,
-        { parse_mode: "Markdown" }
-      );
+        `Do you have a *transaction ID / hash*? Reply *Yes* and paste it, or *No* if you don't have one. 🔎`,
+        { parse_mode: "Markdown" });
+    } else if (stage === "5b") {
+      await bot.sendMessage(chatId,
+        `Please paste your *transaction ID / hash* below. It's usually a long string starting with 0x. 🔎`,
+        { parse_mode: "Markdown" });
     } else if (stage === 6) {
       await bot.sendMessage(chatId,
-        `What is the *amount* involved? Please include the coin name (e.g. *0.5 ETH*, *200 USDT*, *0.002 BTC*). 💰`,
-        { parse_mode: "Markdown" }
-      );
+        `What amount is involved? Please include the coin name (e.g. *0.5 ETH*, *200 USDT*, *0.002 BTC*). 💰`,
+        { parse_mode: "Markdown" });
     }
     return;
   }
 
-  // Meaningful — use meaningfulCount to track stage (not raw messageCount)
-  const count = meaningfulCount;
+  // ── Relevant answer — smart branching ─────────────────────────────────
+  if (stage === 1) {
+    // Detect issue type from their description for smarter follow-up
+    const issueText = tLower;
+    let followUp = `What type of wallet are you using?\n\nExamples: MetaMask, Trust Wallet, OKX, Coinbase, Phantom, Ledger, Binance, etc. 💼`;
 
-  if (count === 1) {
-    // Q1: Describe the issue
-    await bot.sendMessage(chatId,
-      `Hello *${msg.from.first_name}*! 👋\n\nThank you for reaching out. To help you as quickly as possible, I'll need to ask you a few questions.\n\nPlease describe your crypto issue in detail. What exactly is happening? 🔍`,
-      { parse_mode: "Markdown" }
-    );
-  } else if (count === 2) {
-    // Q2: Wallet type
-    await bot.sendMessage(chatId,
-      `Thank you for that information! ✅\n\nWhat type of wallet are you using?\n\nExamples: MetaMask, Trust Wallet, Coinbase Wallet, Phantom, Ledger, Binance, etc. 💼`,
-      { parse_mode: "Markdown" }
-    );
-  } else if (count === 3) {
-    // Q3: Wallet address
-    await bot.sendMessage(chatId,
-      `Got it! 📝\n\nPlease provide your *wallet address*.\n\nThis will allow us to investigate your issue on the blockchain. 🔗`,
-      { parse_mode: "Markdown" }
-    );
-  } else if (count === 4) {
-    // Q4: How long has the issue been occurring
-    await bot.sendMessage(chatId,
-      `Thank you! 🙏\n\nHow long have you been experiencing this issue?\n\nExamples:\n• Just started today\n• A few hours ago\n• Since yesterday\n• Over a week\n• More than a month 🕐`,
-      { parse_mode: "Markdown" }
-    );
-  } else if (count === 5) {
-    // Q5: Transaction ID if applicable
-    await bot.sendMessage(chatId,
-      `Noted! 📋\n\nDo you have a *transaction ID / hash* related to this issue?\n\nIf yes, please paste it below. If not, type *"No transaction ID"*. 🔎`,
-      { parse_mode: "Markdown" }
-    );
-  } else if (count === 6) {
-    // Q6: Amount involved
-    await bot.sendMessage(chatId,
-      `Thank you! 💰\n\nWhat is the *amount* involved in this issue?\n\nPlease include the coin/token name and amount (e.g. *0.5 ETH*, *200 USDT*, *0.002 BTC*). 📊`,
-      { parse_mode: "Markdown" }
-    );
-  } else {
-    // All questions answered — notify agent
-    await bot.sendMessage(chatId,
-      `✅ *Thank you ${msg.from.first_name}!*\n\nWe have collected all the information needed to investigate your issue.\n\n⏳ A support agent has been notified and will be with you shortly.\n\n*Please remain in this chat and do not close it.* 🙏`,
-      { parse_mode: "Markdown" }
-    );
+    if (issueText.includes("login") || issueText.includes("access") || issueText.includes("password") || issueText.includes("locked")) {
+      followUp = `I understand you're having trouble accessing your account. What wallet or platform are you trying to log into? 💼`;
+    } else if (issueText.includes("send") || issueText.includes("transfer") || issueText.includes("stuck") || issueText.includes("pending")) {
+      followUp = `I see you have a transaction issue. What wallet are you sending from? (e.g. MetaMask, Trust Wallet, OKX, etc.) 💼`;
+    } else if (issueText.includes("lost") || issueText.includes("missing") || issueText.includes("disappear") || issueText.includes("gone")) {
+      followUp = `I'm sorry to hear that. To investigate, what wallet were you using when the funds went missing? 💼`;
+    } else if (issueText.includes("scam") || issueText.includes("hack") || issueText.includes("unauthorized") || issueText.includes("stolen")) {
+      followUp = `I understand this is urgent. What wallet was compromised? (e.g. MetaMask, Trust Wallet, OKX, etc.) 💼`;
+    } else if (issueText.includes("swap") || issueText.includes("exchange") || issueText.includes("trade")) {
+      followUp = `I see you have a swap/exchange issue. What platform or wallet were you using? 💼`;
+    } else if (issueText.includes("withdraw") || issueText.includes("deposit")) {
+      followUp = `Got it. What wallet or exchange were you using for this withdrawal/deposit? 💼`;
+    }
 
-    // Send summary to all admins
+    ticket.issueDescription = msg.text;
+    ticket.stage = 2;
+    saveDB(db);
+    await bot.sendMessage(chatId, `Thank you for explaining! ✅\n\n${followUp}`, { parse_mode: "Markdown" });
+
+  } else if (stage === 2) {
+    ticket.walletType = msg.text;
+    ticket.stage = 3;
+    saveDB(db);
+    await bot.sendMessage(chatId,
+      `Got it, *${msg.text}*! 📝\n\nPlease provide your *wallet address* so I can look into this for you.\n\nThis will allow us to investigate your issue on the blockchain. 🔗`,
+      { parse_mode: "Markdown" });
+
+  } else if (stage === 3) {
+    ticket.walletAddress = msg.text;
+    ticket.stage = 4;
+    saveDB(db);
+    await bot.sendMessage(chatId,
+      `Thank you! ✅\n\nHow long have you been experiencing this issue?\n\n• Just started today\n• A few hours ago\n• Since yesterday\n• Over a week\n• More than a month 🕐`,
+      { parse_mode: "Markdown" });
+
+  } else if (stage === 4) {
+    ticket.issueDuration = msg.text;
+    ticket.stage = 5;
+    saveDB(db);
+
+    // Tailor response based on duration
+    let urgencyNote = "";
+    if (tLower.includes("month") || tLower.includes("week") || tLower.includes("long")) {
+      urgencyNote = "\n\n⚠️ Since this has been ongoing for a while, our agent will prioritize your case.";
+    } else if (tLower.includes("today") || tLower.includes("hour") || tLower.includes("just")) {
+      urgencyNote = "\n\n⚡ Since this just happened, there's a higher chance we can resolve it quickly.";
+    }
+
+    await bot.sendMessage(chatId,
+      `Noted! 📋${urgencyNote}\n\nDo you have a *transaction ID / hash* related to this issue?\n\nReply *Yes* and paste it below, or *No* if you don't have one. 🔎`,
+      { parse_mode: "Markdown" });
+
+  } else if (stage === 5) {
+    if (isNo) {
+      // No transaction ID — skip 5b, go straight to Q6
+      ticket.transactionId = "Not provided";
+      ticket.stage = 6;
+      saveDB(db);
+      await bot.sendMessage(chatId,
+        `No problem! 👍\n\nWhat is the *amount* involved in this issue?\n\nPlease include the coin/token name and amount (e.g. *0.5 ETH*, *200 USDT*, *0.002 BTC*). 💰`,
+        { parse_mode: "Markdown" });
+    } else if (isYes) {
+      // Said yes but didn't paste it yet — ask them to paste
+      ticket.stage = "5b";
+      saveDB(db);
+      await bot.sendMessage(chatId,
+        `Please paste your *transaction ID / hash* below. 🔎`,
+        { parse_mode: "Markdown" });
+    } else {
+      // They pasted the tx ID directly without saying yes first
+      ticket.transactionId = msg.text;
+      ticket.stage = 6;
+      saveDB(db);
+      await bot.sendMessage(chatId,
+        `Transaction ID saved! ✅\n\nWhat is the *amount* involved in this issue?\n\nPlease include the coin/token name and amount (e.g. *0.5 ETH*, *200 USDT*, *0.002 BTC*). 💰`,
+        { parse_mode: "Markdown" });
+    }
+
+  } else if (stage === "5b") {
+    // They just pasted their tx ID
+    ticket.transactionId = msg.text;
+    ticket.stage = 6;
+    saveDB(db);
+    await bot.sendMessage(chatId,
+      `Transaction ID saved! ✅\n\nWhat is the *amount* involved in this issue?\n\nPlease include the coin/token name and amount (e.g. *0.5 ETH*, *200 USDT*, *0.002 BTC*). 💰`,
+      { parse_mode: "Markdown" });
+
+  } else if (stage === 6) {
+    ticket.amount = msg.text;
+    ticket.stage = 7;
+    saveDB(db);
+
+    // Final message to user
+    await bot.sendMessage(chatId,
+      `✅ *Thank you ${msg.from.first_name}!*\n\nWe have everything we need to investigate your issue.\n\n` +
+      `📋 *Summary:*\n` +
+      `• Issue: ${ticket.issueDescription ? ticket.issueDescription.slice(0, 60) + "..." : "Provided"}\n` +
+      `• Wallet: ${ticket.walletType || "Provided"}\n` +
+      `• Duration: ${ticket.issueDuration || "Provided"}\n` +
+      `• Amount: ${ticket.amount}\n\n` +
+      `⏳ A support agent has been notified and will be with you shortly.\n\n*Please remain in this chat.* 🙏`,
+      { parse_mode: "Markdown" });
+
+    // Send full summary to admins
     const summary =
       `📋 *Ticket #${ticket.id} — Full Summary*\n` +
       `━━━━━━━━━━━━━━━━━━━━\n` +
       `👤 User: ${ticket.username}\n\n` +
-      ticket.replies.slice(0, 6).map((r, i) =>
-        `*Q${i + 1}:* ${r.message}`
-      ).join("\n\n");
+      `*Issue:* ${ticket.issueDescription || "N/A"}\n\n` +
+      `*Wallet Type:* ${ticket.walletType || "N/A"}\n` +
+      `*Wallet Address:* ${ticket.walletAddress || "N/A"}\n` +
+      `*Duration:* ${ticket.issueDuration || "N/A"}\n` +
+      `*Transaction ID:* ${ticket.transactionId || "N/A"}\n` +
+      `*Amount:* ${ticket.amount || "N/A"}`;
 
     for (const adminId of ADMIN_IDS) {
-      try {
-        await bot.sendMessage(adminId, summary, { parse_mode: "Markdown" });
-      } catch (e) {}
+      try { await bot.sendMessage(adminId, summary, { parse_mode: "Markdown" }); } catch (e) {}
     }
     if (ADMIN_GROUP_ID) {
-      try {
-        await bot.sendMessage(ADMIN_GROUP_ID, summary, { parse_mode: "Markdown" });
-      } catch (e) {}
+      try { await bot.sendMessage(ADMIN_GROUP_ID, summary, { parse_mode: "Markdown" }); } catch (e) {}
     }
+
+  } else {
+    // Stage 7+ — all done, just acknowledge
+    await bot.sendMessage(chatId,
+      `⏳ Our support agent is reviewing your case and will be with you shortly. Please remain in this chat. 🙏`,
+      { parse_mode: "Markdown" });
   }
 });
 
