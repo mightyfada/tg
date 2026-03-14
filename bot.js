@@ -1,822 +1,528 @@
-require("dotenv").config();
-const TelegramBot = require("node-telegram-bot-api");
-const fs = require("fs");
-const https = require("https");
+require('dotenv').config();
+const { Telegraf, Markup, session } = require('telegraf');
+const { v4: uuidv4 } = require('uuid');
 
-// ─── Config ────────────────────────────────────────────────────────────────
-const TOKEN = process.env.TELEGRAM_TOKEN;
-const ADMIN_IDS = process.env.ADMIN_IDS
-  ? process.env.ADMIN_IDS.split(",").map((id) => parseInt(id.trim()))
-  : [];
-const ADMIN_GROUP_ID = process.env.ADMIN_GROUP_ID
-  ? parseInt(process.env.ADMIN_GROUP_ID)
-  : null;
-const GEMINI_KEY = process.env.GEMINI_API_KEY || null;
+const bot = new Telegraf(process.env.BOT_TOKEN);
 
-// ─── Storage ───────────────────────────────────────────────────────────────
-const DB_PATH = "./tickets.json";
-function loadDB() {
-  if (!fs.existsSync(DB_PATH)) fs.writeFileSync(DB_PATH, JSON.stringify({}));
-  return JSON.parse(fs.readFileSync(DB_PATH));
-}
-function saveDB(data) {
-  fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2));
-}
+// ─── In-memory stores (replace with DB for production) ────────────────────────
+// tickets: { ticketId: { userId, adminId, type, status, createdAt, chatHistory } }
+const tickets = new Map();
+// userActiveTicket: { userId: ticketId }
+const userActiveTicket = new Map();
+// adminActiveTicket: { adminId: ticketId }
+const adminActiveTicket = new Map();
 
-// ─── Bot Init ──────────────────────────────────────────────────────────────
-const bot = new TelegramBot(TOKEN, { polling: true });
+// ─── Config ───────────────────────────────────────────────────────────────────
+const ADMIN_GROUP_ID = process.env.ADMIN_GROUP_ID; // Telegram group/channel ID for admins
+const BOT_NAME = process.env.BOT_NAME || 'Live Ticket';
 
-// ─── Helpers ───────────────────────────────────────────────────────────────
+// ─── Ticket types ─────────────────────────────────────────────────────────────
+const TICKET_TYPES = [
+  { id: 'general',      label: 'General Support ❓' },
+  { id: 'technical',    label: 'Technical/Bug Support 🛠️' },
+  { id: 'transaction',  label: 'Transaction Issue 💸' },
+  { id: 'wallet',       label: 'Wallet Problem 👛' },
+  { id: 'swap',         label: 'Swap / Exchange Issue 🔄' },
+  { id: 'deposit',      label: 'Deposit / Withdrawal Issue 🏧' },
+  { id: 'bridge',       label: 'Bridge / Cross-chain Issue 🌉' },
+  { id: 'gas',          label: 'Gas Fee Problem ⛽' },
+  { id: 'defi',         label: 'DeFi / Liquidity Pool Issue 🌊' },
+  { id: 'staking',      label: 'Staking & Rewards 🏦' },
+  { id: 'mining',       label: 'Mining / Validator Support ⛏️' },
+  { id: 'smartcontract',label: 'Smart Contract Issue 📜' },
+  { id: 'nft',          label: 'NFT Issue 🖼️' },
+  { id: 'token',        label: 'Token / Airdrop Issue 🪙' },
+  { id: 'lost',         label: 'Lost / Stolen Funds 🔓' },
+  { id: 'network',      label: 'Network Congestion Issue 🌐' },
+  { id: 'account',      label: 'Account Issues 🔐' },
+  { id: 'kyc',          label: 'KYC Support ✅' },
+  { id: 'scam',         label: 'Scam / Suspicious Activity 🚨' },
+  { id: 'feedback',     label: 'Feedback & Suggestions 💡' },
+  { id: 'other',        label: 'Other 📩' },
+];
+
+// ─── Type-specific prompts ────────────────────────────────────────────────────
+const TYPE_PROMPTS = {
+  general:     `📋 *General Support*\n\nPlease describe your issue in as much detail as possible. Include any relevant screenshots or files.`,
+  technical:   `🛠️ *Technical/Bug Support*\n\nPlease provide:\n1. A clear description of the issue\n2. Steps to reproduce the problem\n3. Screenshots or error messages\n4. Your device/browser information`,
+  transaction: `💸 *Transaction Issue*\n\nPlease provide:\n1. Transaction hash / TX ID\n2. The wallet address involved\n3. Amount and token/coin sent\n4. Source and destination network\n5. Date and time of the transaction\n6. Description of what went wrong (stuck, failed, missing funds, etc.)`,
+  wallet:      `👛 *Wallet Problem*\n\nPlease provide:\n1. Your wallet address (⚠️ never share your private key or seed phrase)\n2. The wallet app/extension you are using\n3. The network affected (e.g. Ethereum, BSC, Solana)\n4. A clear description of the problem\n5. Any error messages you see`,
+  swap:        `🔄 *Swap / Exchange Issue*\n\nPlease provide:\n1. Transaction hash / TX ID of the swap\n2. Token pair (e.g. ETH → USDT)\n3. Amount sent and amount expected to receive\n4. Platform or DEX used (e.g. Uniswap, PancakeSwap)\n5. Network and date of the swap\n6. Description of the issue`,
+  deposit:     `🏧 *Deposit / Withdrawal Issue*\n\nPlease provide:\n1. Transaction hash / TX ID\n2. Your wallet address\n3. Amount and token/coin involved\n4. Platform (exchange or app) used\n5. Network (e.g. Ethereum, BSC, Tron)\n6. Date and time of the deposit or withdrawal\n7. Description of the issue (not credited, stuck, wrong network, etc.)`,
+  bridge:      `🌉 *Bridge / Cross-chain Issue*\n\nPlease provide:\n1. Transaction hash / TX ID\n2. Source network and destination network (e.g. Ethereum → BSC)\n3. Token and amount bridged\n4. Bridge platform used (e.g. Stargate, Multichain, LayerZero)\n5. Date and time of the bridge transaction\n6. Description of what went wrong (funds not arrived, stuck in bridge, etc.)`,
+  gas:         `⛽ *Gas Fee Problem*\n\nPlease provide:\n1. Transaction hash / TX ID (if applicable)\n2. Network affected (e.g. Ethereum, Polygon)\n3. Wallet app you are using\n4. Description of the issue (transaction stuck, unusually high gas, gas estimation failed, etc.)\n5. Screenshots of any error messages`,
+  defi:        `🌊 *DeFi / Liquidity Pool Issue*\n\nPlease provide:\n1. Your wallet address\n2. Protocol or platform name (e.g. Aave, Curve, Uniswap V3)\n3. Token pair or pool involved\n4. Amount of liquidity or funds affected\n5. Transaction hash if applicable\n6. Description of the issue (impermanent loss concern, can't remove liquidity, wrong pool share, etc.)`,
+  mining:      `⛏️ *Mining / Validator Support*\n\nPlease provide:\n1. Your validator or miner wallet address\n2. Network you are mining/validating (e.g. Ethereum, Solana, Cosmos)\n3. Amount of funds or stake involved\n4. Description of the issue (missed rewards, slashing, node not syncing, payout not received, etc.)\n5. Transaction hash or epoch number if applicable`,
+  smartcontract:`📜 *Smart Contract Issue*\n\nPlease provide:\n1. Smart contract address\n2. Network the contract is deployed on\n3. Transaction hash of the failed or problematic interaction\n4. Function or action you were trying to execute\n5. Error message or revert reason\n6. Description of what went wrong`,
+  lost:        `🔓 *Lost / Stolen Funds*\n\n⚠️ *Important: Do not share your private key or seed phrase with anyone.*\n\nPlease provide:\n1. Your wallet address\n2. Approximate amount and token/coin lost\n3. Transaction hash(es) if available\n4. Network involved\n5. How the loss occurred (wrong address, hacked, phishing, etc.)\n6. Date and time of the incident\n7. Any suspicious addresses or links involved`,
+  network:     `🌐 *Network Congestion Issue*\n\nPlease provide:\n1. Network affected (e.g. Ethereum, Solana, BSC)\n2. Transaction hash if you have a pending transaction\n3. Wallet app you are using\n4. Description of the issue (transaction pending too long, failed due to congestion, can't send, etc.)\n5. Date and time the issue started`,
+  staking:     `🏦 *Staking & Rewards*\n\nPlease provide:\n1. Your wallet address\n2. Token/coin you are staking\n3. Platform or protocol used\n4. Amount staked\n5. Description of the issue (missing rewards, unable to unstake, wrong APY, etc.)\n6. Transaction hash if applicable`,
+  nft:         `🖼️ *NFT Issue*\n\nPlease provide:\n1. Your wallet address\n2. NFT collection name and token ID\n3. Marketplace involved (e.g. OpenSea, Blur)\n4. Transaction hash if applicable\n5. Description of the issue (not appearing, transfer failed, wrong metadata, etc.)`,
+  token:       `🪙 *Token / Airdrop Issue*\n\nPlease provide:\n1. Token name and contract address\n2. Your wallet address\n3. Network (e.g. Ethereum, BSC, Solana)\n4. Description of the issue (token not received, wrong amount, can't claim airdrop, etc.)\n5. Transaction hash if applicable`,
+  account:     `🔐 *Account Issues*\n\nPlease describe your account problem. *Do not share your password or private key.*\n\nInclude your registered email or username so we can look up your account.`,
+  kyc:         `✅ *KYC Support*\n\nPlease provide:\n1. The email address used during KYC\n2. A description of the issue you're facing\n3. Any error messages you received`,
+  scam:        `🚨 *Scam / Suspicious Activity*\n\n⚠️ *Important: Never share your private key or seed phrase with anyone, including support agents.*\n\nPlease provide:\n1. Description of what happened\n2. Any wallet addresses or links involved\n3. Transaction hashes if funds were moved\n4. Screenshots of suspicious messages or activity\n5. Date and time of the incident`,
+  feedback:    `💡 *Feedback & Suggestions*\n\nWe'd love to hear from you! Please share:\n1. What feature or area your feedback relates to\n2. Your suggestion or observation\n3. How this would improve your experience`,
+  other:       `📩 *Other*\n\nPlease describe your inquiry in detail so we can route it to the right team.`,
+};
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 function generateTicketId() {
-  return Math.floor(1000 + Math.random() * 9000).toString();
+  return 'TKT-' + uuidv4().split('-')[0].toUpperCase();
 }
 
-// ─── AI Response Validator (Google Gemini) ─────────────────────────────────
-async function isResponseRelevant(question, userReply) {
-  if (!GEMINI_KEY) return null; // fall back to manual check if no key
-
-  const prompt =
-    "You are a support bot validator for a crypto support system. A user was asked this question:\n" +
-    "QUESTION: " + question + "\n\n" +
-    "The user replied:\n" +
-    "REPLY: " + userReply + "\n\n" +
-    "Does the reply make sense as an answer to the question? " +
-    "Be lenient — short answers like wallet names (MetaMask, OKX, Trust), time references (today, yesterday, a week), " +
-    "amounts (0.5 ETH, 200 USDT), or brief but relevant answers are valid. " +
-    "Only say NO if the reply is completely unrelated, gibberish, or nonsensical. " +
-    "Reply with only one word: YES or NO.";
-
-  try {
-    const postData = JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { maxOutputTokens: 5, temperature: 0 }
-    });
-
-    const result = await new Promise((resolve, reject) => {
-      const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=" + GEMINI_KEY;
-      const urlObj = new URL(url);
-      const req = https.request({
-        hostname: urlObj.hostname,
-        path: urlObj.pathname + urlObj.search,
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(postData)
-        }
-      }, (res) => {
-        let body = "";
-        res.on("data", (chunk) => body += chunk);
-        res.on("end", () => {
-          try { resolve(JSON.parse(body)); }
-          catch (e) { reject(e); }
-        });
-      });
-      req.on("error", reject);
-      req.setTimeout(8000, () => { req.destroy(); reject(new Error("Timeout")); });
-      req.write(postData);
-      req.end();
-    });
-
-    const text = result?.candidates?.[0]?.content?.parts?.[0]?.text?.trim().toUpperCase() || "NO";
-    return text.startsWith("YES");
-  } catch (e) {
-    console.log("Gemini check failed:", e.message);
-    return null; // fall back to manual check
-  }
+function getTicketByUser(userId) {
+  const ticketId = userActiveTicket.get(userId);
+  return ticketId ? tickets.get(ticketId) : null;
 }
 
-function isAdmin(userId) {
-  return ADMIN_IDS.includes(userId);
+function getTicketByAdmin(adminId) {
+  const ticketId = adminActiveTicket.get(adminId);
+  return ticketId ? tickets.get(ticketId) : null;
 }
 
-function statusEmoji(status) {
-  return { open: "🟢", claimed: "🟡", closed: "🔴" }[status] ?? "⚪";
+function closeTicketSession(ticketId) {
+  const ticket = tickets.get(ticketId);
+  if (!ticket) return;
+  ticket.status = 'closed';
+  ticket.closedAt = new Date();
+  userActiveTicket.delete(ticket.userId);
+  if (ticket.adminId) adminActiveTicket.delete(ticket.adminId);
 }
 
-function getAgentName(user) {
-  return user.username ? `@${user.username}` : user.first_name;
+function formatTicketInfo(ticket) {
+  const typeLabel = TICKET_TYPES.find(t => t.id === ticket.type)?.label || ticket.type;
+  const adminStatus = ticket.adminId ? '✅ Admin assigned' : '⏳ Waiting for admin';
+  return `🎫 *Ticket ID:* \`${ticket.ticketId}\`\n📂 *Type:* ${typeLabel}\n${adminStatus}`;
 }
 
-// ─── /start ────────────────────────────────────────────────────────────────
-bot.onText(/\/start/, (msg) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
+// ─── /start ───────────────────────────────────────────────────────────────────
+bot.start(async (ctx) => {
+  const userId = ctx.from.id;
+  const existing = getTicketByUser(userId);
 
-  if (isAdmin(userId)) {
-    return bot.sendMessage(
-      chatId,
-      `👋 Welcome back, *${msg.from.first_name}*!\n\nYou are logged in as a *Support Agent*.\n\n*Available Commands:*\n` +
-      `/tickets — View all tickets\n` +
-      `/claim <id> — Claim a ticket\n` +
-      `/close <id> — Close a ticket\n` +
-      `/reply <id> <message> — Reply to a user`,
-      { parse_mode: "Markdown" }
+  if (existing && existing.status === 'open') {
+    return ctx.reply(
+      `⚠️ You already have an open ticket.\n\n${formatTicketInfo(existing)}\n\nPlease close your current ticket before opening a new one.`,
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('🔴 Close Current Ticket', `close_${existing.ticketId}`)],
+        ]),
+      }
     );
   }
 
-  return bot.sendMessage(
-    chatId,
-    `👋 Welcome to *Support Ticket*!\n\nOur support team is here to help you.\nClick the button below to open a ticket and we'll assist you shortly.`,
+  const buttons = TICKET_TYPES.map(t =>
+    [Markup.button.callback(t.label, `type_${t.id}`)]
+  );
+
+  await ctx.reply(
+    `👋 Welcome to *${BOT_NAME}*!\n\nPlease select the ticket type below based on your inquiry:`,
     {
-      parse_mode: "Markdown",
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "📨 Create Ticket", callback_data: "open_ticket" }],
-        ],
-      },
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard(buttons),
     }
   );
 });
 
-// ─── /tickets (admin) ──────────────────────────────────────────────────────
-bot.onText(/\/tickets/, (msg) => {
-  if (!isAdmin(msg.from.id)) return;
-  const db = loadDB();
-  const tickets = Object.values(db);
-  if (!tickets.length) return bot.sendMessage(msg.chat.id, "No tickets yet.");
+// ─── Ticket type selection ────────────────────────────────────────────────────
+TICKET_TYPES.forEach(({ id }) => {
+  bot.action(`type_${id}`, async (ctx) => {
+    await ctx.answerCbQuery();
+    const userId = ctx.from.id;
 
-  const list = tickets
-    .slice(-20)
-    .map((t) => `${statusEmoji(t.status)} *#${t.id}* — ${t.username} _(${t.status})_`)
-    .join("\n");
-
-  return bot.sendMessage(msg.chat.id, `📋 *All Tickets (last 20):*\n\n${list}`, {
-    parse_mode: "Markdown",
-  });
-});
-
-// ─── /claim <id> (admin) ───────────────────────────────────────────────────
-bot.onText(/\/claim (.+)/, async (msg, match) => {
-  if (!isAdmin(msg.from.id)) return;
-  const ticketId = match[1].trim();
-  const db = loadDB();
-  const ticket = db[ticketId];
-
-  if (!ticket) return bot.sendMessage(msg.chat.id, `❌ Ticket #${ticketId} not found.`);
-  if (ticket.claimedBy)
-    return bot.sendMessage(msg.chat.id, `❌ Already claimed by ${ticket.claimedByName}.`);
-
-  const agentName = getAgentName(msg.from);
-  ticket.claimedBy = msg.from.id;
-  ticket.claimedByName = agentName;
-  ticket.status = "claimed";
-  saveDB(db);
-
-  await bot.sendMessage(
-    ticket.chatId,
-    `✅ *Your ticket has been assigned!*\n\n*${agentName}* (Support Agent) has been assigned to your ticket and will assist you shortly.`,
-    { parse_mode: "Markdown" }
-  );
-
-  return bot.sendMessage(
-    msg.chat.id,
-    `✅ You claimed ticket *#${ticketId}*.\n\nUse /reply ${ticketId} <message> to respond to the user.`,
-    { parse_mode: "Markdown" }
-  );
-});
-
-// ─── /close <id> (admin) ───────────────────────────────────────────────────
-bot.onText(/\/close (.+)/, async (msg, match) => {
-  if (!isAdmin(msg.from.id)) return;
-  const ticketId = match[1].trim();
-  const db = loadDB();
-  const ticket = db[ticketId];
-
-  if (!ticket) return bot.sendMessage(msg.chat.id, `❌ Ticket #${ticketId} not found.`);
-  if (ticket.status === "closed")
-    return bot.sendMessage(msg.chat.id, `❌ Ticket #${ticketId} is already closed.`);
-
-  const agentName = getAgentName(msg.from);
-  ticket.status = "closed";
-  ticket.closedAt = Date.now();
-  saveDB(db);
-
-  await bot.sendMessage(
-    ticket.chatId,
-    `🔒 *Your ticket #${ticketId} has been closed.*\n\nThank you for reaching out! We hope your issue has been resolved 🙏\n\nIf you need further help, open a new ticket below.`,
-    {
-      parse_mode: "Markdown",
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "📨 Open New Ticket", callback_data: "open_ticket" }],
-        ],
-      },
-    }
-  );
-
-  return bot.sendMessage(msg.chat.id, `✅ Ticket *#${ticketId}* closed.`, {
-    parse_mode: "Markdown",
-  });
-});
-
-// ─── /reply <id> <message> (admin) ────────────────────────────────────────
-bot.onText(/\/reply (\d+) (.+)/s, async (msg, match) => {
-  if (!isAdmin(msg.from.id)) return;
-  const ticketId = match[1];
-  const replyText = match[2].trim();
-  const db = loadDB();
-  const ticket = db[ticketId];
-
-  if (!ticket) return bot.sendMessage(msg.chat.id, `❌ Ticket #${ticketId} not found.`);
-  if (ticket.status === "closed")
-    return bot.sendMessage(msg.chat.id, `❌ Ticket #${ticketId} is already closed.`);
-
-  const agentName = getAgentName(msg.from);
-
-  await bot.sendMessage(
-    ticket.chatId,
-    `💬 *${agentName}* (Support Agent):\n\n${replyText}`,
-    { parse_mode: "Markdown" }
-  );
-
-  ticket.replies.push({
-    author: agentName,
-    message: replyText.slice(0, 300),
-    timestamp: Date.now(),
-  });
-  saveDB(db);
-
-  return bot.sendMessage(msg.chat.id, `✅ Reply sent to ticket *#${ticketId}*.`, {
-    parse_mode: "Markdown",
-  });
-});
-
-// ─── Button Callbacks ──────────────────────────────────────────────────────
-bot.on("callback_query", async (query) => {
-  // Ignore expired callbacks silently
-  try { await bot.answerCallbackQuery(query.id).catch(() => {}); } catch (e) {}
-  try {
-  const userId = query.from.id;
-  const chatId = query.message.chat.id;
-  const data = query.data;
-
-  // ── Open Ticket ──────────────────────────────────────────────────────────
-  if (data === "open_ticket") {
-    const db = loadDB();
-    const existing = Object.values(db).find(
-      (t) => t.userId === userId && t.status !== "closed"
-    );
-
-    if (existing) {
-      return bot.answerCallbackQuery(query.id, {
-        text: `You already have open ticket #${existing.id}. Please wait for an agent.`,
-        show_alert: true,
-      });
+    const existing = getTicketByUser(userId);
+    if (existing && existing.status === 'open') {
+      return ctx.reply('⚠️ You already have an open ticket. Please close it first.');
     }
 
     const ticketId = generateTicketId();
-    const username = query.from.username
-      ? `@${query.from.username}`
-      : query.from.first_name;
-
-    db[ticketId] = {
-      id: ticketId,
+    const ticket = {
+      ticketId,
       userId,
-      username,
-      firstName: query.from.first_name,
-      chatId,
-      status: "open",
-      openedAt: Date.now(),
-      claimedBy: null,
-      claimedByName: null,
-      replies: [],
-      messageCount: 0,
+      adminId: null,
+      type: id,
+      status: 'open',
+      createdAt: new Date(),
+      closedAt: null,
+      userInfo: {
+        name: ctx.from.first_name + (ctx.from.last_name ? ' ' + ctx.from.last_name : ''),
+        username: ctx.from.username || 'N/A',
+      },
     };
-    saveDB(db);
 
-    // Confirm to user
-    await bot.editMessageText(
-      `✅ *Ticket #${ticketId} Created!*\n\nHello ${query.from.first_name}, how may I assist you today?\n\nPlease describe your issue below 👇`,
+    tickets.set(ticketId, ticket);
+    userActiveTicket.set(userId, ticketId);
+
+    // Edit the original message to remove buttons
+    try {
+      await ctx.editMessageText(
+        `✅ *Ticket type selected:* ${TICKET_TYPES.find(t => t.id === id)?.label}`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (_) {}
+
+    // Send ticket ID and prompt
+    await ctx.reply(
+      `🎫 *Your Ticket ID:* \`${ticketId}\`\n\nKeep this ID for reference.\n\n${TYPE_PROMPTS[id]}`,
       {
-        chat_id: chatId,
-        message_id: query.message.message_id,
-        parse_mode: "Markdown",
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('🔴 Cancel Ticket', `close_${ticketId}`)],
+        ]),
       }
     );
+  });
+});
 
-    // Notify all admins
-    const adminMsg =
-      `🔔 *New Ticket #${ticketId}*\n\n` +
-      `👤 User: ${username}\n` +
-      `🆔 User ID: \`${userId}\`\n` +
-      `🕐 Time: ${new Date().toUTCString()}\n\n` +
-      `Tap *Claim* to assign this ticket to yourself.`;
+// ─── User sends a message (bridges to admin or awaits admin) ──────────────────
+bot.on('message', async (ctx) => {
+  const userId = ctx.from.id;
 
-    const adminKeyboard = {
-      inline_keyboard: [
-        [
-          { text: "✅ Claim", callback_data: `claim_${ticketId}` },
-          { text: "🔒 Close", callback_data: `close_${ticketId}` },
-        ],
-      ],
-    };
-
-    for (const adminId of ADMIN_IDS) {
-      try {
-        await bot.sendMessage(adminId, adminMsg, {
-          parse_mode: "Markdown",
-          reply_markup: adminKeyboard,
+  // ── Admin side: relay message to user ──
+  const adminTicket = getTicketByAdmin(userId);
+  if (adminTicket && adminTicket.status === 'open') {
+    // Forward admin message to the user
+    const adminName = ctx.from.first_name + (ctx.from.last_name ? ' ' + ctx.from.last_name : '');
+    try {
+      if (ctx.message.text) {
+        await bot.telegram.sendMessage(
+          adminTicket.userId,
+          `💬 *Support Agent:* ${escapeMarkdown(ctx.message.text)}`,
+          { parse_mode: 'Markdown' }
+        );
+      } else if (ctx.message.photo) {
+        const photo = ctx.message.photo[ctx.message.photo.length - 1];
+        await bot.telegram.sendPhoto(adminTicket.userId, photo.file_id, {
+          caption: ctx.message.caption ? `💬 *Support Agent:* ${ctx.message.caption}` : '📷 Image from support agent',
+          parse_mode: 'Markdown',
         });
-      } catch (e) {
-        console.log(`Could not notify admin ${adminId}:`, e.message);
+      } else if (ctx.message.document) {
+        await bot.telegram.sendDocument(adminTicket.userId, ctx.message.document.file_id, {
+          caption: `📎 *File from support agent*`,
+          parse_mode: 'Markdown',
+        });
       }
+      await ctx.react('👍').catch(() => {});
+    } catch (err) {
+      console.error('Error relaying admin message to user:', err.message);
+      await ctx.reply('⚠️ Could not deliver your message to the user.');
     }
+    return;
+  }
 
+  // ── User side: relay message to assigned admin ──
+  const userTicket = getTicketByUser(userId);
+  if (!userTicket || userTicket.status !== 'open') {
+    return ctx.reply(
+      '👋 No active ticket found. Send /start to open a new ticket.',
+      Markup.inlineKeyboard([[Markup.button.callback('🎫 Open New Ticket', 'new_ticket')]])
+    );
+  }
+
+  // Ticket exists but no admin yet — message is queued/logged
+  if (!userTicket.adminId) {
+    await ctx.reply(
+      `⏳ *Your message has been received.*\n\nAn available support agent will join your ticket shortly. Please be patient!\n\n_Ticket ID: \`${userTicket.ticketId}\`_`,
+      { parse_mode: 'Markdown' }
+    );
+
+    // Notify admin group about new message
     if (ADMIN_GROUP_ID) {
       try {
-        await bot.sendMessage(ADMIN_GROUP_ID, adminMsg, {
-          parse_mode: "Markdown",
-          reply_markup: adminKeyboard,
-        });
-      } catch (e) {
-        console.log("Could not notify admin group:", e.message);
+        const typeLabel = TICKET_TYPES.find(t => t.id === userTicket.type)?.label || userTicket.type;
+        const notifText = ctx.message.text
+          ? `💬 *New message from user:*\n${escapeMarkdown(ctx.message.text)}`
+          : '📎 User sent a file/photo';
+
+        await bot.telegram.sendMessage(
+          ADMIN_GROUP_ID,
+          `🔔 *Ticket Update* — \`${userTicket.ticketId}\`\n📂 ${typeLabel}\n👤 ${userTicket.userInfo.name} (@${userTicket.userInfo.username})\n\n${notifText}`,
+          {
+            parse_mode: 'Markdown',
+            ...Markup.inlineKeyboard([
+              [Markup.button.callback(`✋ Claim Ticket`, `claim_${userTicket.ticketId}`)],
+            ]),
+          }
+        );
+      } catch (err) {
+        console.error('Could not notify admin group:', err.message);
       }
-    }
-
-    await bot.answerCallbackQuery(query.id);
-    return;
-  }
-
-  // ── Claim Button ─────────────────────────────────────────────────────────
-  if (data.startsWith("claim_")) {
-    if (!isAdmin(userId)) {
-      return bot.answerCallbackQuery(query.id, {
-        text: "❌ You are not authorized to claim tickets.",
-        show_alert: true,
-      });
-    }
-
-    const ticketId = data.split("_")[1];
-    const db = loadDB();
-    const ticket = db[ticketId];
-
-    if (!ticket)
-      return bot.answerCallbackQuery(query.id, { text: "❌ Ticket not found.", show_alert: true });
-    if (ticket.claimedBy)
-      return bot.answerCallbackQuery(query.id, {
-        text: `❌ Already claimed by ${ticket.claimedByName}.`,
-        show_alert: true,
-      });
-
-    const agentName = getAgentName(query.from);
-    ticket.claimedBy = userId;
-    ticket.claimedByName = agentName;
-    ticket.status = "claimed";
-    saveDB(db);
-
-    await bot.editMessageText(
-      `✅ *Ticket #${ticketId} — CLAIMED*\n\n` +
-      `👤 User: ${ticket.username}\n` +
-      `🛡️ Agent: ${agentName}\n\n` +
-      `Use /reply ${ticketId} <message> to respond to the user.`,
-      {
-        chat_id: chatId,
-        message_id: query.message.message_id,
-        parse_mode: "Markdown",
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: "🔒 Close Ticket", callback_data: `close_${ticketId}` }],
-          ],
-        },
-      }
-    );
-
-    await bot.sendMessage(
-      ticket.chatId,
-      `✅ *Your ticket has been assigned!*\n\n*${agentName}* (Support Agent) has been assigned to your ticket and will assist you shortly.`,
-      { parse_mode: "Markdown" }
-    );
-
-    await bot.answerCallbackQuery(query.id, {
-      text: `✅ You claimed ticket #${ticketId}`,
-    });
-    return;
-  }
-
-  // ── Close Button ─────────────────────────────────────────────────────────
-  } catch (e) {
-    if (!e.message.includes('query is too old') && !e.message.includes('query ID is invalid')) {
-      console.error('Callback error:', e.message);
     }
     return;
   }
 
-  if (data.startsWith("close_")) {
-    if (!isAdmin(userId)) {
-      return bot.answerCallbackQuery(query.id, {
-        text: "❌ You are not authorized to close tickets.",
-        show_alert: true,
+  // Admin is assigned — relay message
+  try {
+    if (ctx.message.text) {
+      await bot.telegram.sendMessage(
+        userTicket.adminId,
+        `👤 *User:* ${escapeMarkdown(ctx.message.text)}`,
+        { parse_mode: 'Markdown' }
+      );
+    } else if (ctx.message.photo) {
+      const photo = ctx.message.photo[ctx.message.photo.length - 1];
+      await bot.telegram.sendPhoto(userTicket.adminId, photo.file_id, {
+        caption: ctx.message.caption ? `👤 *User:* ${ctx.message.caption}` : '📷 Photo from user',
+        parse_mode: 'Markdown',
+      });
+    } else if (ctx.message.document) {
+      await bot.telegram.sendDocument(userTicket.adminId, ctx.message.document.file_id, {
+        caption: `📎 *File from user*`,
+        parse_mode: 'Markdown',
       });
     }
-
-    const ticketId = data.split("_")[1];
-    const db = loadDB();
-    const ticket = db[ticketId];
-
-    if (!ticket)
-      return bot.answerCallbackQuery(query.id, { text: "❌ Ticket not found.", show_alert: true });
-
-    const agentName = getAgentName(query.from);
-    ticket.status = "closed";
-    ticket.closedAt = Date.now();
-    saveDB(db);
-
-    await bot.editMessageText(
-      `🔒 *Ticket #${ticketId} — CLOSED*\n\n` +
-      `👤 User: ${ticket.username}\n` +
-      `🛡️ Closed by: ${agentName}\n` +
-      `🕐 ${new Date().toUTCString()}`,
-      {
-        chat_id: chatId,
-        message_id: query.message.message_id,
-        parse_mode: "Markdown",
-      }
-    );
-
-    await bot.sendMessage(
-      ticket.chatId,
-      `🔒 *Your ticket #${ticketId} has been closed.*\n\nThank you for reaching out! We hope your issue has been resolved 🙏\n\nIf you need further help, open a new ticket below.`,
-      {
-        parse_mode: "Markdown",
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: "📨 Open New Ticket", callback_data: "open_ticket" }],
-          ],
-        },
-      }
-    );
-
-    await bot.answerCallbackQuery(query.id, {
-      text: `✅ Ticket #${ticketId} closed.`,
-    });
-    return;
+  } catch (err) {
+    console.error('Error relaying user message to admin:', err.message);
   }
 });
 
-// ─── User Message Handler (auto-responses) ─────────────────────────────────
-bot.on("message", async (msg) => {
-  if (!msg.text) return;
-  if (msg.text.startsWith("/")) return;
-  if (isAdmin(msg.from.id)) return;
+// ─── Admin claims a ticket ────────────────────────────────────────────────────
+bot.action(/^claim_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery('Claiming ticket...');
+  const ticketId = ctx.match[1];
+  const adminId = ctx.from.id;
+  const ticket = tickets.get(ticketId);
 
-  const userId = msg.from.id;
-  const chatId = msg.chat.id;
-  const db = loadDB();
+  if (!ticket) return ctx.reply('❌ Ticket not found.');
+  if (ticket.status !== 'open') return ctx.reply('❌ This ticket is already closed.');
+  if (ticket.adminId) return ctx.reply('⚠️ This ticket has already been claimed by another agent.');
+  if (adminActiveTicket.has(adminId)) {
+    return ctx.reply('⚠️ You already have an active ticket. Close it first with /endticket.');
+  }
 
-  const ticket = Object.values(db).find(
-    (t) => t.userId === userId && t.status !== "closed"
-  );
+  ticket.adminId = adminId;
+  ticket.claimedAt = new Date();
+  adminActiveTicket.set(adminId, ticketId);
 
-  if (!ticket) {
-    return bot.sendMessage(
-      chatId,
-      `You don't have an open ticket. Click below to create one:`,
+  const adminName = ctx.from.first_name + (ctx.from.last_name ? ' ' + ctx.from.last_name : '');
+  const typeLabel = TICKET_TYPES.find(t => t.id === ticket.type)?.label || ticket.type;
+
+  // Edit the claim message in admin group
+  try {
+    await ctx.editMessageText(
+      `✅ *Ticket Claimed* — \`${ticketId}\`\n📂 ${typeLabel}\n👤 User: ${ticket.userInfo.name} (@${ticket.userInfo.username})\n🧑‍💼 Agent: ${adminName}`,
       {
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: "📨 Create Ticket", callback_data: "open_ticket" }],
-          ],
-        },
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('🔴 Close Ticket', `close_${ticketId}`)],
+        ]),
       }
     );
+  } catch (_) {}
+
+  // Notify admin (in DM)
+  try {
+    await bot.telegram.sendMessage(
+      adminId,
+      `🎫 *You've claimed Ticket \`${ticketId}\`*\n📂 ${typeLabel}\n👤 User: ${ticket.userInfo.name} (@${ticket.userInfo.username})\n\nYou are now connected to the user. All messages you send here will be forwarded to them.\n\nUse /endticket to close this session.`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (err) {
+    // Admin hasn't started bot yet
+    await ctx.reply(`⚠️ Could not DM the agent. @${ctx.from.username || adminId} please start a chat with the bot first.`);
+    ticket.adminId = null;
+    adminActiveTicket.delete(adminId);
+    return;
   }
 
-  // Save message
-  ticket.replies.push({
-    author: msg.from.username || msg.from.first_name,
-    message: msg.text.slice(0, 300),
-    timestamp: Date.now(),
-  });
-  ticket.messageCount = (ticket.messageCount || 0) + 1;
-  saveDB(db);
+  // Notify user that admin has joined
+  try {
+    await bot.telegram.sendMessage(
+      ticket.userId,
+      `✅ *A support agent has joined your ticket!*\n\n🧑‍💼 You are now connected to a live support agent. Please describe your issue and they will assist you.\n\n_Ticket ID: \`${ticketId}\`_`,
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('🔴 Close Ticket', `close_${ticketId}`)],
+        ]),
+      }
+    );
+  } catch (err) {
+    console.error('Could not notify user:', err.message);
+  }
+});
 
-  // Forward every user message to all admins in real time
-  const forwardMsg =
-    `📨 *${ticket.username}* (Ticket #${ticket.id}):\n\n${msg.text}`;
+// ─── Close ticket (button handler) ───────────────────────────────────────────
+bot.action(/^close_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const ticketId = ctx.match[1];
+  await handleCloseTicket(ctx, ticketId, ctx.from.id);
+});
 
-  for (const adminId of ADMIN_IDS) {
+// ─── /endticket command (admin shortcut) ─────────────────────────────────────
+bot.command('endticket', async (ctx) => {
+  const adminId = ctx.from.id;
+  const ticket = getTicketByAdmin(adminId);
+  if (!ticket) {
+    return ctx.reply('⚠️ You have no active ticket session.');
+  }
+  await handleCloseTicket(ctx, ticket.ticketId, adminId);
+});
+
+// ─── Close ticket logic ───────────────────────────────────────────────────────
+async function handleCloseTicket(ctx, ticketId, closedBy) {
+  const ticket = tickets.get(ticketId);
+  if (!ticket) return ctx.reply('❌ Ticket not found.');
+  if (ticket.status === 'closed') return ctx.reply('ℹ️ This ticket is already closed.');
+
+  const typeLabel = TICKET_TYPES.find(t => t.id === ticket.type)?.label || ticket.type;
+  const closedAt = new Date().toLocaleString();
+
+  closeTicketSession(ticketId);
+
+  const summaryMsg =
+    `🔴 *Ticket Closed*\n\n` +
+    `🎫 *Ticket ID:* \`${ticketId}\`\n` +
+    `📂 *Type:* ${typeLabel}\n` +
+    `🕐 *Closed at:* ${closedAt}\n\n` +
+    `Thank you for contacting support. Send /start to open a new ticket anytime.`;
+
+  // Notify user
+  try {
+    await bot.telegram.sendMessage(ticket.userId, summaryMsg, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('🎫 Open New Ticket', 'new_ticket')],
+        [Markup.button.callback('⭐ Rate Support', `rate_${ticketId}`)],
+      ]),
+    });
+  } catch (err) {
+    console.error('Could not notify user of close:', err.message);
+  }
+
+  // Notify admin (if assigned and close not triggered by admin themselves)
+  if (ticket.adminId && ticket.adminId !== closedBy) {
     try {
-      await bot.sendMessage(adminId, forwardMsg, { parse_mode: "Markdown" });
-    } catch (e) {
-      console.log(`Could not forward to admin ${adminId}:`, e.message);
+      await bot.telegram.sendMessage(
+        ticket.adminId,
+        `🔴 *Ticket \`${ticketId}\` has been closed by the user.*\n\nYour session has ended.`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (err) {
+      console.error('Could not notify admin of close:', err.message);
     }
+  } else if (ticket.adminId && ticket.adminId === closedBy) {
+    // Tell admin their session ended
+    await ctx.reply(`✅ Ticket \`${ticketId}\` closed. Session ended.`, { parse_mode: 'Markdown' });
   }
+
+  // Update admin group notification
   if (ADMIN_GROUP_ID) {
     try {
-      await bot.sendMessage(ADMIN_GROUP_ID, forwardMsg, { parse_mode: "Markdown" });
-    } catch (e) {
-      console.log("Could not forward to admin group:", e.message);
-    }
+      await bot.telegram.sendMessage(
+        ADMIN_GROUP_ID,
+        `🔴 *Ticket Closed* — \`${ticketId}\`\n📂 ${typeLabel}\n👤 ${ticket.userInfo.name} (@${ticket.userInfo.username})\n🕐 ${closedAt}`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (_) {}
+  }
+}
+
+// ─── Open new ticket (button) ─────────────────────────────────────────────────
+bot.action('new_ticket', async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from.id;
+  const existing = getTicketByUser(userId);
+  if (existing && existing.status === 'open') {
+    return ctx.reply('⚠️ You already have an open ticket.');
   }
 
-  // Stop auto-responses once claimed — admin takes over
-  if (ticket.claimedBy) return;
+  const buttons = TICKET_TYPES.map(t =>
+    [Markup.button.callback(t.label, `type_${t.id}`)]
+  );
 
-  // ── Meaningful message detection ─────────────────────────────────────────
-  function isMeaningful(text) {
-    const t = text.trim().toLowerCase();
-    if (t.length <= 2) return false;
-
-    // ── Always accept known wallet names ──────────────────────────────────
-    const walletNames = [
-      "metamask","trust","trustwallet","trust wallet","coinbase","phantom",
-      "ledger","trezor","binance","okx","okx wallet","bybit","kraken",
-      "exodus","atomic","myetherwallet","mew","rainbow","argent","zerion",
-      "1inch","uniswap","pancakeswap","keplr","terra","solflare","slope",
-      "backpack","glow","safe","gnosis","imtoken","tokenpocket","bitkeep",
-      "safepal","mathwallet","ellipal","secux","bitbox","keepkey","ngrave",
-      "rabby","frame","status","unstoppable","xdefi","sender","near","petra",
-      "martian","pontem","fewcha","welldone","coin98","onto","alphawallet"
-    ];
-    if (walletNames.some((w) => t === w || t.includes(w))) return true;
-
-    const junk = [
-      "ok","okay","k","kk","yes","no","nope","yep","sure","hi","hello","hey",
-      "hmm","hm","uh","um","lol","lmao","haha","hehe","what","why","how",
-      "idk","idc","nvm","never mind","nothing","test","testing","hello?",
-      "??","???","...","w","ww","www","good","fine","cool","nice","great"
-    ];
-    if (junk.includes(t)) return false;
-
-    const wordCount = t.split(/\s+/).filter(Boolean).length;
-    if (wordCount < 3 && t.length < 15) return false;
-
-    // Repeated characters — "aaaaaaa"
-    if (/([a-z])\1{4,}/.test(t)) return false;
-
-    // Keyboard mashing — "asdfgh", "qwerty"
-    const mashPatterns = [/asdf/i, /qwer/i, /zxcv/i, /hjkl/i, /uiop/i];
-    if (mashPatterns.some((p) => p.test(t))) return false;
-
-    // All same word repeated
-    const words = t.split(/\s+/).filter(Boolean);
-    const uniqueWords = new Set(words);
-    if (words.length >= 3 && uniqueWords.size === 1) return false;
-
-    // No vowels = gibberish
-    const letters = t.replace(/[^a-z]/g, "");
-    if (letters.length > 5) {
-      const vowels = (t.match(/[aeiou]/g) || []).length;
-      if (vowels / letters.length < 0.1) return false;
+  await ctx.reply(
+    `👋 *Open a New Ticket*\n\nPlease select the ticket type:`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard(buttons),
     }
+  );
+});
 
-    // Real word check — at least 40% must be recognizable words
-    const commonWords = new Set([
-      "i","my","me","we","us","you","he","she","they","it","is","am","are",
-      "was","were","have","has","had","do","did","does","will","would","could",
-      "should","can","the","a","an","and","or","but","if","in","on","at","to",
-      "for","of","with","by","from","not","so","this","that","what","when",
-      "where","who","how","help","need","want","problem","issue","error","money",
-      "send","receive","wallet","account","access","funds","transaction","transfer",
-      "crypto","bitcoin","eth","token","address","balance","withdraw","deposit",
-      "please","thank","thanks","cant","cannot","dont","lost","stuck","wrong",
-      "tried","still","just","get","got","see","know","think","make","use","used",
-      "today","yesterday","week","month","hours","days","ago","since","long","been",
-      "metamask","trust","coinbase","phantom","ledger","binance","amount","usdt",
-      "btc","bnb","matic","sol","hash","id","number","started","happening","issue"
-    ]);
-    const words2 = t.split(/\s+/).filter(Boolean);
-    const realCount = words2.filter((w) => commonWords.has(w)).length;
-    if (words2.length <= 6 && realCount / words2.length < 0.35) return false;
-
-    return true;
-  }
-
-  // Count only meaningful replies so far for this ticket
-  const meaningfulCount = ticket.replies.filter(
-    (r) => r.author === (msg.from.username || msg.from.first_name) && isMeaningful(r.message)
-  ).length;
-
-  await bot.sendChatAction(chatId, "typing");
-  await new Promise((r) => setTimeout(r, 2500));
-
-  const tLower = msg.text.trim().toLowerCase();
-  const isNo = ["no","nope","nah","none","i don't","i dont","don't have","dont have","no tx","no transaction","n/a","na"].some(w => tLower.includes(w));
-  const isYes = ["yes","yep","yeah","i have","i do","sure"].some(w => tLower === w || tLower.startsWith(w + " "));
-
-  // ── Smart stage tracking stored on ticket ──────────────────────────────
-  if (!ticket.stage) ticket.stage = 1;
-  const stage = ticket.stage;
-
-  // ── Question map ────────────────────────────────────────────────────────
-  const questionMap = {
-    1: "Please describe your crypto issue in detail. What exactly is happening?",
-    2: "What type of wallet are you using? (e.g. MetaMask, Trust Wallet, Coinbase, Ledger)",
-    3: "Please provide your wallet address.",
-    4: "How long have you been experiencing this issue?",
-    5: "Do you have a transaction ID or hash related to this issue?",
-    "5b": "Please paste your transaction ID / hash below.",
-    6: "What is the amount involved? Include coin name and amount (e.g. 0.5 ETH, 200 USDT).",
-  };
-
-  // Stages that accept yes/no
-  const yesNoStages = [5];
-  const isYesNo = isYes || isNo;
-
-  // Run manual meaningful check
-  let relevant = isMeaningful(msg.text);
-
-  // Allow yes/no for stages that accept it
-  if (!relevant && isYesNo && yesNoStages.includes(stage)) relevant = true;
-
-  // AI double-check
-  if (relevant && GEMINI_KEY) {
-    const currentQuestion = questionMap[stage] || questionMap[1];
-    const aiResult = await isResponseRelevant(currentQuestion, msg.text);
-    if (aiResult !== null) relevant = aiResult;
-  }
-
-  // ── Not relevant — repeat current question with nudge ──────────────────
-  if (!relevant) {
-    if (stage === 1) {
-      // Check if they said a greeting — respond warmly instead of scolding
-      const greetings = ["hi","hey","hello","hii","heyyy","heyy","good morning","good afternoon","good evening","morning","afternoon","evening","howdy","sup","what's up","whats up","greetings","yo"];
-      const isGreeting = greetings.some(g => tLower === g || tLower.startsWith(g + " ") || tLower.endsWith(" " + g));
-
-      if (isGreeting) {
-        await bot.sendMessage(chatId,
-          `Hello *${msg.from.first_name}*! 👋 How are you?\n\nI'm here to help you with any crypto issues you may be experiencing.\n\nCould you please describe what's going on so I can assist you? 🔍`,
-          { parse_mode: "Markdown" });
-      } else {
-        await bot.sendMessage(chatId,
-          `I need a bit more detail, *${msg.from.first_name}*. What crypto issue are you experiencing exactly? 🔍`,
-          { parse_mode: "Markdown" });
-      }
-    } else if (stage === 2) {
-      await bot.sendMessage(chatId,
-        `What wallet are you using? (e.g. MetaMask, Trust Wallet, OKX, Coinbase, Ledger) 💼`,
-        { parse_mode: "Markdown" });
-    } else if (stage === 3) {
-      await bot.sendMessage(chatId,
-        `Please send your *wallet address* — it starts with 0x for ETH/BSC wallets. 🔗`,
-        { parse_mode: "Markdown" });
-    } else if (stage === 4) {
-      await bot.sendMessage(chatId,
-        `How long has this been happening? (e.g. today, yesterday, a few hours, over a week) 🕐`,
-        { parse_mode: "Markdown" });
-    } else if (stage === 5) {
-      await bot.sendMessage(chatId,
-        `Do you have a *transaction ID / hash*? Reply *Yes* and paste it, or *No* if you don't have one. 🔎`,
-        { parse_mode: "Markdown" });
-    } else if (stage === "5b") {
-      await bot.sendMessage(chatId,
-        `Please paste your *transaction ID / hash* below. It's usually a long string starting with 0x. 🔎`,
-        { parse_mode: "Markdown" });
-    } else if (stage === 6) {
-      await bot.sendMessage(chatId,
-        `What amount is involved? Please include the coin name (e.g. *0.5 ETH*, *200 USDT*, *0.002 BTC*). 💰`,
-        { parse_mode: "Markdown" });
+// ─── Rating handler ───────────────────────────────────────────────────────────
+bot.action(/^rate_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const ticketId = ctx.match[1];
+  await ctx.reply(
+    `⭐ *Rate your support experience for ticket \`${ticketId}\`*\n\nHow would you rate the support you received?`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [
+          Markup.button.callback('⭐', `rating_1_${ticketId}`),
+          Markup.button.callback('⭐⭐', `rating_2_${ticketId}`),
+          Markup.button.callback('⭐⭐⭐', `rating_3_${ticketId}`),
+          Markup.button.callback('⭐⭐⭐⭐', `rating_4_${ticketId}`),
+          Markup.button.callback('⭐⭐⭐⭐⭐', `rating_5_${ticketId}`),
+        ],
+      ]),
     }
-    return;
-  }
+  );
+});
 
-  // ── Relevant answer — smart branching ─────────────────────────────────
-  if (stage === 1) {
-    // Detect issue type from their description for smarter follow-up
-    const issueText = tLower;
-    let followUp = `What type of wallet are you using?\n\nExamples: MetaMask, Trust Wallet, OKX, Coinbase, Phantom, Ledger, Binance, etc. 💼`;
+bot.action(/^rating_(\d)_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery('Thanks for rating!');
+  const stars = parseInt(ctx.match[1]);
+  const ticketId = ctx.match[2];
+  const ticket = tickets.get(ticketId);
+  if (ticket) ticket.rating = stars;
 
-    if (issueText.includes("login") || issueText.includes("access") || issueText.includes("password") || issueText.includes("locked")) {
-      followUp = `I understand you're having trouble accessing your account. What wallet or platform are you trying to log into? 💼`;
-    } else if (issueText.includes("send") || issueText.includes("transfer") || issueText.includes("stuck") || issueText.includes("pending")) {
-      followUp = `I see you have a transaction issue. What wallet are you sending from? (e.g. MetaMask, Trust Wallet, OKX, etc.) 💼`;
-    } else if (issueText.includes("lost") || issueText.includes("missing") || issueText.includes("disappear") || issueText.includes("gone")) {
-      followUp = `I'm sorry to hear that. To investigate, what wallet were you using when the funds went missing? 💼`;
-    } else if (issueText.includes("scam") || issueText.includes("hack") || issueText.includes("unauthorized") || issueText.includes("stolen")) {
-      followUp = `I understand this is urgent. What wallet was compromised? (e.g. MetaMask, Trust Wallet, OKX, etc.) 💼`;
-    } else if (issueText.includes("swap") || issueText.includes("exchange") || issueText.includes("trade")) {
-      followUp = `I see you have a swap/exchange issue. What platform or wallet were you using? 💼`;
-    } else if (issueText.includes("withdraw") || issueText.includes("deposit")) {
-      followUp = `Got it. What wallet or exchange were you using for this withdrawal/deposit? 💼`;
-    }
+  const starStr = '⭐'.repeat(stars);
+  await ctx.editMessageText(
+    `${starStr} *Thank you for your feedback!*\n\nYour rating has been recorded. We appreciate your time!`,
+    { parse_mode: 'Markdown' }
+  );
 
-    ticket.issueDescription = msg.text;
-    ticket.stage = 2;
-    saveDB(db);
-    await bot.sendMessage(chatId, `Thank you for explaining! ✅\n\n${followUp}`, { parse_mode: "Markdown" });
-
-  } else if (stage === 2) {
-    ticket.walletType = msg.text;
-    ticket.stage = 3;
-    saveDB(db);
-    await bot.sendMessage(chatId,
-      `Got it, *${msg.text}*! 📝\n\nPlease provide your *wallet address* so I can look into this for you.\n\nThis will allow us to investigate your issue on the blockchain. 🔗`,
-      { parse_mode: "Markdown" });
-
-  } else if (stage === 3) {
-    ticket.walletAddress = msg.text;
-    ticket.stage = 4;
-    saveDB(db);
-    await bot.sendMessage(chatId,
-      `Thank you! ✅\n\nHow long have you been experiencing this issue?\n\n• Just started today\n• A few hours ago\n• Since yesterday\n• Over a week\n• More than a month 🕐`,
-      { parse_mode: "Markdown" });
-
-  } else if (stage === 4) {
-    ticket.issueDuration = msg.text;
-    ticket.stage = 5;
-    saveDB(db);
-
-    // Tailor response based on duration
-    let urgencyNote = "";
-    if (tLower.includes("month") || tLower.includes("week") || tLower.includes("long")) {
-      urgencyNote = "\n\n⚠️ Since this has been ongoing for a while, our agent will prioritize your case.";
-    } else if (tLower.includes("today") || tLower.includes("hour") || tLower.includes("just")) {
-      urgencyNote = "\n\n⚡ Since this just happened, there's a higher chance we can resolve it quickly.";
-    }
-
-    await bot.sendMessage(chatId,
-      `Noted! 📋${urgencyNote}\n\nDo you have a *transaction ID / hash* related to this issue?\n\nReply *Yes* and paste it below, or *No* if you don't have one. 🔎`,
-      { parse_mode: "Markdown" });
-
-  } else if (stage === 5) {
-    if (isNo) {
-      // No transaction ID — skip 5b, go straight to Q6
-      ticket.transactionId = "Not provided";
-      ticket.stage = 6;
-      saveDB(db);
-      await bot.sendMessage(chatId,
-        `No problem! 👍\n\nWhat is the *amount* involved in this issue?\n\nPlease include the coin/token name and amount (e.g. *0.5 ETH*, *200 USDT*, *0.002 BTC*). 💰`,
-        { parse_mode: "Markdown" });
-    } else if (isYes) {
-      // Said yes but didn't paste it yet — ask them to paste
-      ticket.stage = "5b";
-      saveDB(db);
-      await bot.sendMessage(chatId,
-        `Please paste your *transaction ID / hash* below. 🔎`,
-        { parse_mode: "Markdown" });
-    } else {
-      // They pasted the tx ID directly without saying yes first
-      ticket.transactionId = msg.text;
-      ticket.stage = 6;
-      saveDB(db);
-      await bot.sendMessage(chatId,
-        `Transaction ID saved! ✅\n\nWhat is the *amount* involved in this issue?\n\nPlease include the coin/token name and amount (e.g. *0.5 ETH*, *200 USDT*, *0.002 BTC*). 💰`,
-        { parse_mode: "Markdown" });
-    }
-
-  } else if (stage === "5b") {
-    // They just pasted their tx ID
-    ticket.transactionId = msg.text;
-    ticket.stage = 6;
-    saveDB(db);
-    await bot.sendMessage(chatId,
-      `Transaction ID saved! ✅\n\nWhat is the *amount* involved in this issue?\n\nPlease include the coin/token name and amount (e.g. *0.5 ETH*, *200 USDT*, *0.002 BTC*). 💰`,
-      { parse_mode: "Markdown" });
-
-  } else if (stage === 6) {
-    ticket.amount = msg.text;
-    ticket.stage = 7;
-    saveDB(db);
-
-    // Final message to user
-    await bot.sendMessage(chatId,
-      `✅ *Thank you ${msg.from.first_name}!*\n\nWe have everything we need to investigate your issue.\n\n` +
-      `📋 *Summary:*\n` +
-      `• Issue: ${ticket.issueDescription ? ticket.issueDescription.slice(0, 60) + "..." : "Provided"}\n` +
-      `• Wallet: ${ticket.walletType || "Provided"}\n` +
-      `• Duration: ${ticket.issueDuration || "Provided"}\n` +
-      `• Amount: ${ticket.amount}\n\n` +
-      `⏳ A support agent has been notified and will be with you shortly.\n\n*Please remain in this chat.* 🙏`,
-      { parse_mode: "Markdown" });
-
-    // Send full summary to admins
-    const summary =
-      `📋 *Ticket #${ticket.id} — Full Summary*\n` +
-      `━━━━━━━━━━━━━━━━━━━━\n` +
-      `👤 User: ${ticket.username}\n\n` +
-      `*Issue:* ${ticket.issueDescription || "N/A"}\n\n` +
-      `*Wallet Type:* ${ticket.walletType || "N/A"}\n` +
-      `*Wallet Address:* ${ticket.walletAddress || "N/A"}\n` +
-      `*Duration:* ${ticket.issueDuration || "N/A"}\n` +
-      `*Transaction ID:* ${ticket.transactionId || "N/A"}\n` +
-      `*Amount:* ${ticket.amount || "N/A"}`;
-
-    for (const adminId of ADMIN_IDS) {
-      try { await bot.sendMessage(adminId, summary, { parse_mode: "Markdown" }); } catch (e) {}
-    }
-    if (ADMIN_GROUP_ID) {
-      try { await bot.sendMessage(ADMIN_GROUP_ID, summary, { parse_mode: "Markdown" }); } catch (e) {}
-    }
-
-  } else {
-    // Stage 7+ — all done, just acknowledge
-    await bot.sendMessage(chatId,
-      `⏳ Our support agent is reviewing your case and will be with you shortly. Please remain in this chat. 🙏`,
-      { parse_mode: "Markdown" });
+  if (ADMIN_GROUP_ID) {
+    try {
+      const typeLabel = TICKET_TYPES.find(t => t.id === ticket?.type)?.label || '';
+      await bot.telegram.sendMessage(
+        ADMIN_GROUP_ID,
+        `⭐ *Support Rating Received*\n🎫 Ticket: \`${ticketId}\` ${typeLabel}\n👤 ${ticket?.userInfo?.name || 'User'}\n\nRating: ${starStr} (${stars}/5)`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (_) {}
   }
 });
 
-// ─── Global Error Handlers (prevent crashes) ──────────────────────────────
-bot.on("polling_error", (err) => {
-  if (!err.message.includes("ETELEGRAM")) {
-    console.error("Polling error:", err.message);
+// ─── Admin commands ───────────────────────────────────────────────────────────
+bot.command('mystatus', async (ctx) => {
+  const adminId = ctx.from.id;
+  const ticket = getTicketByAdmin(adminId);
+  if (!ticket) {
+    return ctx.reply('ℹ️ You have no active ticket session.');
   }
+  const typeLabel = TICKET_TYPES.find(t => t.id === ticket.type)?.label || ticket.type;
+  ctx.reply(
+    `🧑‍💼 *Your Active Session*\n\n${formatTicketInfo(ticket)}\n📂 ${typeLabel}\n👤 User: ${ticket.userInfo.name} (@${ticket.userInfo.username})\n\nUse /endticket to close.`,
+    { parse_mode: 'Markdown' }
+  );
 });
 
-process.on("unhandledRejection", (err) => {
-  const msg = err?.message ?? String(err);
-  if (msg.includes("query is too old") || msg.includes("query ID is invalid")) return;
-  console.error("Unhandled rejection:", msg);
+bot.command('help', (ctx) => {
+  ctx.reply(
+    `*${BOT_NAME} — Help*\n\n` +
+    `*User Commands:*\n` +
+    `/start — Open a new support ticket\n\n` +
+    `*Admin Commands:*\n` +
+    `/endticket — Close your current active ticket\n` +
+    `/mystatus — View your current active ticket\n\n` +
+    `_For support, open a ticket using /start_`,
+    { parse_mode: 'Markdown' }
+  );
 });
 
-console.log("✅ Telegram Support Ticket Bot is running...");
+// ─── Escape markdown helper ───────────────────────────────────────────────────
+function escapeMarkdown(text) {
+  return text.replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+}
+
+// ─── Launch ───────────────────────────────────────────────────────────────────
+bot.launch();
+console.log(`🤖 ${BOT_NAME} bot is running...`);
+
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
