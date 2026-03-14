@@ -1,10 +1,14 @@
 {
-  "name": "telegram-ticket-bot",
+  "name": "live-ticket-bot",
   "version": "1.0.0",
+  "description": "Telegram live support ticket bot",
   "main": "bot.js",
-  "scripts": { "start": "node bot.js" },
+  "scripts": {
+    "start": "node bot.js"
+  },
   "dependencies": {
-    "node-telegram-bot-api": "^0.66.0",
-    "dotenv": "^16.0.0"
+    "dotenv": "^16.0.0",
+    "telegraf": "^4.16.3",
+    "uuid": "^9.0.0"
   }
 }
